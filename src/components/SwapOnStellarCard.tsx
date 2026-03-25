@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import {
   Card,
   CardAction,
@@ -18,6 +19,7 @@ import {
 } from '@/components/ui/select'
 import { Button } from './ui/button'
 import { BorderBeam } from './magicui/border-beam'
+import DonationCard from './DonationCard'
 
 const SelectToken = () => {
   return (
@@ -51,37 +53,74 @@ const WalletBalance = () => {
 }
 
 export default function SwapOnStellarCardSection() {
+  const [selectedToken, setSelectedToken] = useState<string>('xlm')
+  const [isSwapped, setIsSwapped] = useState(false)
+  const [isSwapping, setIsSwapping] = useState(false)
+
+  // Simulated available balance (in production, this would come from wallet state)
+  const availableBalance = '$1.59'
+
+  const handleSwap = async () => {
+    setIsSwapping(true)
+    
+    // Simulate swap transaction
+    // In production, this would call the actual swap logic
+    await new Promise(resolve => setTimeout(resolve, 2000))
+    
+    setIsSwapping(false)
+    setIsSwapped(true)
+  }
+
+  const handleDonationComplete = (txHash: string, amount: string) => {
+    console.log('Donation completed:', { txHash, amount })
+  }
+
   return (
-    <Card className=' mb-4'>
-      <CardHeader>
-        <CardDescription>Available Balance</CardDescription>
-        <CardTitle className=" font-bold text-2xl">$ 1.59</CardTitle>
-        <hr color="white" className=" mt-2 w-full" />
-      </CardHeader>
-      <CardContent>
-        <h1 className=" font-bold text-lg mb-2">Swap To</h1>
-        <SelectToken />
-        <WalletBalance />
-      </CardContent>
-      <CardFooter>
-        <Button
-                      className="relative overflow-hidden w-full !bg-accent"
-                      size="lg"
-                      variant="outline"
-                    >
-                      Swap Now
-                      <BorderBeam
-                        size={40}
-                        initialOffset={20}
-                        className="from-transparent via-yellow-500 to-transparent"
-                        transition={{
-                          type: 'tween',
-                          stiffness: 60,
-                          damping: 20,
-                        }}
-                      />
-                    </Button>
-      </CardFooter>
-    </Card>
+    <div className="space-y-4">
+      <Card className=' mb-4'>
+        <CardHeader>
+          <CardDescription>Available Balance</CardDescription>
+          <CardTitle className=" font-bold text-2xl">{availableBalance}</CardTitle>
+          <hr color="white" className=" mt-2 w-full" />
+        </CardHeader>
+        <CardContent>
+          <h1 className=" font-bold text-lg mb-2">Swap To</h1>
+          <SelectToken />
+          <WalletBalance />
+        </CardContent>
+        <CardFooter>
+          <Button
+            onClick={handleSwap}
+            disabled={isSwapping}
+            className="relative overflow-hidden w-full !bg-accent"
+            size="lg"
+            variant="outline"
+          >
+            {isSwapping ? 'Swapping...' : isSwapped ? 'Swap Complete!' : 'Swap Now'}
+            {!isSwapping && (
+              <BorderBeam
+                size={40}
+                initialOffset={20}
+                className="from-transparent via-yellow-500 to-transparent"
+                transition={{
+                  type: 'tween',
+                  stiffness: 60,
+                  damping: 20,
+                }}
+              />
+            )}
+          </Button>
+        </CardFooter>
+      </Card>
+
+      {/* Donation Card - appears after successful swap */}
+      {isSwapped && (
+        <DonationCard
+          amount={availableBalance}
+          showDonationCard={true}
+          onDonationComplete={handleDonationComplete}
+        />
+      )}
+    </div>
   )
 }

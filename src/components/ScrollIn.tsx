@@ -18,6 +18,16 @@ import {
   AlbedoModule,
 } from '@creit.tech/stellar-wallets-kit'
 
+import { Connection } from '@solana/web3.js'
+import {
+  bridgeSplBatch,
+  evaluateAllbridgeSupport,
+  type SolanaWalletAdapter,
+  type SplDustToken,
+  type BatchBridgeResult,
+} from '@/lib/solana/bridge'
+import { DUST_AGGREGATOR_CONTRACT } from '@/config/env'
+
 import {
   WALLETCONNECT_PROJECT_ID,
   WALLETCONNECT_ENABLED,
@@ -94,7 +104,7 @@ interface DustBalance {
   symbol: string
   amount: number
   usdValue: number
-  network: 'starknet' | 'stellar'
+  network: 'starknet' | 'stellar' | 'solana'
 }
 
 interface BatchGroup {
@@ -508,6 +518,7 @@ const EligibilityBanner: React.FC<{ eligible: number; total: number; minThreshol
 // ─── WalletBalances (main export) ─────────────────────────────────────────────
 
 export default function WalletBalances() {
+  const [solanaAddress, setSolanaAddress] = useState<string | null>(null)
   const [starknetBalances, setStarknetBalances] = useState<Balances>({})
   const [stellarBalances, setStellarBalances] = useState<StellarBalance[]>([])
   const [starknetAddress, setStarknetAddress] = useState<string | null>(null)
@@ -590,6 +601,71 @@ export default function WalletBalances() {
     }
   }
 
+  const fetchSolanaBalances = async () => {
+  try {
+    // Check Allbridge support once on first connect
+    if (allbridgeSupported === null) {
+      const support = await evaluateAllbridgeSupport()
+      setAllbridgeSupported(support.supported)
+      if (!support.supported) {
+        console.warn('[Solana] Allbridge SOL ↔ STELLAR not available:', support.reason)
+        // We still connect the wallet — user can see balances even if bridging
+        // is not yet available
+      }
+    }
+
+    // Use window.solana (Phantom / Solflare inject this)
+    // For a production app this should use @solana/wallet-adapter-react
+    const solana = (window as Window & { solana?: SolanaWalletAdapter }).solana
+    if (!solana) {
+      throw new Error(
+        'No Solana wallet found. Install Phantom or Solflare to continue.'
+      )
+    }
+
+    await (solana as SolanaWalletAdapter & { connect: () => Promise<void> }).connect()
+    if (!solana.publicKey) throw new Error('Wallet connected but publicKey is null')
+
+    const rpcUrl =
+      process.env.NEXT_PUBLIC_SOLANA_RPC_URL ?? 'https://api.devnet.solana.com'
+    const connection = new Connection(rpcUrl, 'finalized')
+
+    setSolanaAddress(solana.publicKey.toBase58())
+    setSolanaWallet(solana)
+    setSolanaConnection(connection)
+
+    // Fetch SPL token accounts for this wallet via RPC
+    // getParsedTokenAccountsByOwner returns all non-zero token accounts
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      solana.publicKey,
+      { programId: new (await import('@solana/web3.js')).PublicKey(
+        'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
+      ) }
+    )
+
+    const splTokens: SplDustToken[] = tokenAccounts.value
+      .map(({ account }) => {
+        const info = account.data.parsed?.info
+        if (!info) return null
+        const amount = BigInt(info.tokenAmount?.amount ?? '0')
+        if (amount === 0n) return null // skip empty accounts
+        return {
+          mint: info.mint as string,
+          symbol: (info.mint as string).slice(0, 4).toUpperCase(), // placeholder until price feed
+          amountRaw: amount,
+          decimals: info.tokenAmount?.decimals ?? 0,
+          usdValue: 0, // populated by price feed integration — left as 0 for now
+        } satisfies SplDustToken
+      })
+      .filter((t): t is SplDustToken => t !== null)
+
+    setSolanaBalances(splTokens)
+  } catch (error) {
+    console.error('Error connecting Solana wallet:', error)
+    throw error
+  }
+}
+
   const handleTokenSelection = (tokenId: string, selected: boolean) => {
     setSelectedTokens(prev => {
       const next = new Set(prev)
@@ -641,6 +717,19 @@ export default function WalletBalances() {
         dustBalances.push({ id: tokenId, asset: bal.asset_code || 'XLM', symbol, amount: parseFloat(bal.balance), usdValue: parseFloat(bal.balance), network: 'stellar' })
       }
     })
+    solanaBalances.forEach((token, idx) => {
+  const tokenId = `solana-${idx}`
+  if (selectedTokens.has(tokenId)) {
+    dustBalances.push({
+      id: tokenId,
+      asset: token.mint,
+      symbol: token.symbol,
+      amount: Number(token.amountRaw) / 10 ** token.decimals,
+      usdValue: token.usdValue,
+      network: 'solana',
+    })
+  }
+})
     return dustBalances
   }
 

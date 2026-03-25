@@ -4,6 +4,7 @@ import './globals.css'
 import { ThemeProvider } from '@/components/theme-provider'
 import HeaderSection from '@/components/Header'
 import StarknetProviderWrapper from './providers/StarknetProvider'
+import { UIProvider } from './contexts/UIContext'
 
 const geistSans = Geist({
   variable: '--font-geist-sans',
@@ -103,10 +104,12 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          <StarknetProviderWrapper>
-            <HeaderSection />
-            {children}
-          </StarknetProviderWrapper>
+          <UIProvider>
+            <StarknetProviderWrapper>
+              <HeaderSection />
+              {children}
+            </StarknetProviderWrapper>
+          </UIProvider>
         </ThemeProvider>
       </body>
     </html>

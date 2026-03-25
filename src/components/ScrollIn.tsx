@@ -524,6 +524,9 @@ export default function WalletBalances() {
   const [starknetAddress, setStarknetAddress] = useState<string | null>(null)
   const [stellarAddress, setStellarAddress] = useState<string | null>(null)
   const [selectedTokens, setSelectedTokens] = useState<Set<string>>(new Set())
+  const [stellarAccountError, setStellarAccountError] = useState<'not_found' | 'rate_limit' | 'maintenance' | null>(null)
+  const [stellarGeneralError, setStellarGeneralError] = useState<string | null>(null)
+  const [isLoadingFriendbot, setIsLoadingFriendbot] = useState(false)
 
   const [minThreshold, setMinThreshold] = useState<number>(() => {
     if (typeof window === 'undefined') return DEFAULT_MIN_THRESHOLD
@@ -585,7 +588,7 @@ export default function WalletBalances() {
               setStellarBalances(data.balances || [])
               resolve()
             } catch (err) {
-              console.error('Error fetching Stellar balances:', err)
+              console.error('Error in onWalletSelected:', err)
               reject(err)
             }
           },

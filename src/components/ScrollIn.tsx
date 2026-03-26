@@ -80,6 +80,103 @@ import {
 const DEFAULT_MIN_THRESHOLD = 0.01
 const LOCALSTORAGE_THRESHOLD_KEY = 'dustAggregator_minThreshold'
 
+// Rate limiting configuration
+const REFRESH_DEBOUNCE_MS = 10000 // 10 seconds minimum between manual refreshes
+const CACHE_TTL_MS = 30000 // 30 seconds cache for Horizon and RPC calls
+const MAX_RETRIES = 3
+const INITIAL_BACKOFF_MS = 1000 // 1 second initial backoff
+const MAX_BACKOFF_MS = 30000 // 30 seconds max backoff
+
+// ─── Cache Types ────────────────────────────────────────────────────────────────
+
+interface CacheEntry<T> {
+  data: T
+  timestamp: number
+}
+
+// Simple in-memory cache for API responses
+class ApiCache<T> {
+  private cache = new Map<string, CacheEntry<T>>()
+
+  get(key: string): T | null {
+    const entry = this.cache.get(key)
+    if (!entry) return null
+    if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+      this.cache.delete(key)
+      return null
+    }
+    return entry.data
+  }
+
+  set(key: string, data: T): void {
+    this.cache.set(key, { data, timestamp: Date.now() })
+  }
+
+  clear(): void {
+    this.cache.clear()
+  }
+}
+
+// Global cache instances
+const starknetBalanceCache = new ApiCache<Record<string, number>>()
+const stellarBalanceCache = new ApiCache<StellarBalance[]>()
+
+// ─── Rate Limiting Helpers ─────────────────────────────────────────────────────
+
+interface RateLimitResponse {
+  allowed: boolean
+  remaining: number
+  resetIn: number
+}
+
+async function checkRateLimit(): Promise<RateLimitResponse> {
+  try {
+    const res = await fetch('/api/rate-limit', { method: 'POST' })
+    const data = await res.json()
+    return data as RateLimitResponse
+  } catch (error) {
+    // If rate limit endpoint fails, allow the request
+    console.warn('Rate limit check failed, allowing request:', error)
+    return { allowed: true, remaining: 30, resetIn: 60 }
+  }
+}
+
+// Exponential backoff for failed API requests
+async function fetchWithBackoff(
+  fetchFn: () => Promise<unknown>,
+  maxRetries: number = MAX_RETRIES,
+  initialDelay: number = INITIAL_BACKOFF_MS
+): Promise<unknown> {
+  let lastError: Error | null = null
+  let delay = initialDelay
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fetchFn()
+    } catch (error) {
+      lastError = error as Error
+      console.warn(`Attempt ${attempt + 1} failed, retrying in ${delay}ms...`, error)
+      await new Promise(resolve => setTimeout(resolve, delay))
+      delay = Math.min(delay * 2, MAX_BACKOFF_MS)
+    }
+  }
+
+  throw lastError || new Error('Max retries exceeded')
+}
+
+// Check if refresh is allowed (debounce)
+function canRefresh(lastRefreshTime: number | null): { allowed: boolean; remainingSeconds: number } {
+  if (!lastRefreshTime) return { allowed: true, remainingSeconds: 0 }
+  
+  const elapsed = Date.now() - lastRefreshTime
+  if (elapsed >= REFRESH_DEBOUNCE_MS) return { allowed: true, remainingSeconds: 0 }
+  
+  return {
+    allowed: false,
+    remainingSeconds: Math.ceil((REFRESH_DEBOUNCE_MS - elapsed) / 1000)
+  }
+}
+
 // ─── Interfaces ───────────────────────────────────────────────────────────────
 
 interface TokenInfo {
@@ -528,6 +625,17 @@ export default function WalletBalances() {
   const [stellarGeneralError, setStellarGeneralError] = useState<string | null>(null)
   const [isLoadingFriendbot, setIsLoadingFriendbot] = useState(false)
 
+  // Rate limiting state
+  const [lastRefreshTime, setLastRefreshTime] = useState<number | null>(null)
+  const [rateLimitedUntil, setRateLimitedUntil] = useState<number | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+
+  // Missing state variables (existing code issue - adding for rate limiting to work)
+  const [allbridgeSupported, setAllbridgeSupported] = useState<boolean | null>(null)
+  const [solanaBalances, setSolanaBalances] = useState<SplDustToken[]>([])
+  const [solanaWallet, setSolanaWallet] = useState<SolanaWalletAdapter | null>(null)
+  const [solanaConnection, setSolanaConnection] = useState<Connection | null>(null)
+
   const [minThreshold, setMinThreshold] = useState<number>(() => {
     if (typeof window === 'undefined') return DEFAULT_MIN_THRESHOLD
     const stored = localStorage.getItem(LOCALSTORAGE_THRESHOLD_KEY)
@@ -548,6 +656,21 @@ export default function WalletBalances() {
   // END TEMP TEST
 
   const fetchStarknetBalances = async () => {
+    // Check rate limit
+    const rateLimit = await checkRateLimit()
+    if (!rateLimit.allowed) {
+      setRateLimitedUntil(Date.now() + rateLimit.resetIn * 1000)
+      console.warn('Rate limited - cannot fetch Starknet balances')
+      return
+    }
+
+    // Check cache
+    const cached = starknetBalanceCache.get('starknet-balances')
+    if (cached) {
+      setStarknetBalances(cached)
+      return
+    }
+
     try {
       const provider = new RpcProvider({ nodeUrl: 'https://starknet-sepolia.public.blastapi.io' })
       const { wallet } = await connectStarknet({
@@ -559,33 +682,66 @@ export default function WalletBalances() {
       const address = w.selectedAddress || w.selectedAccount?.address || w.account?.address
       setStarknetAddress(address ?? null)
       if (!address) return
-      const balancesObj: Balances = {}
-      for (const [, token] of Object.entries(TOKENS)) {
-        const contract = createStarknetContract(token.address, provider)
-        const result = await contract.balanceOf(address)
-        const balance = uint256.uint256ToBN(result.balance as Parameters<typeof uint256.uint256ToBN>[0])
-        balancesObj[token.symbol] = Number(balance.toString()) / 10 ** token.decimals
-      }
+
+      // Use exponential backoff for balance fetching
+      const balancesObj = await fetchWithBackoff(async () => {
+        const result: Balances = {}
+        for (const [, token] of Object.entries(TOKENS)) {
+          const contract = createStarknetContract(token.address, provider)
+          const balanceResult = await contract.balanceOf(address)
+          const balance = uint256.uint256ToBN(balanceResult.balance as Parameters<typeof uint256.uint256ToBN>[0])
+          result[token.symbol] = Number(balance.toString()) / 10 ** token.decimals
+        }
+        return result
+      }) as Balances
+
       setStarknetBalances(balancesObj)
+      starknetBalanceCache.set('starknet-balances', balancesObj)
+      setLastRefreshTime(Date.now())
+      setRateLimitedUntil(null)
     } catch (error) {
       console.error('Error connecting to Starknet:', error)
     }
   }
 
   const fetchStellarBalances = async () => {
+    // Check rate limit
+    const rateLimit = await checkRateLimit()
+    if (!rateLimit.allowed) {
+      setRateLimitedUntil(Date.now() + rateLimit.resetIn * 1000)
+      console.warn('Rate limited - cannot fetch Stellar balances')
+      return
+    }
+
+    // Check cache
+    const cached = stellarBalanceCache.get('stellar-balances')
+    if (cached) {
+      setStellarBalances(cached)
+      return
+    }
+
     try {
       const kit = initStellarKit()
       return new Promise<void>((resolve, reject) => {
         kit.openModal({
-          onWalletSelected: async (wallet) => {
+          onWalletSelected: async (wallet: { id: string }) => {
             try {
               kit.setWallet(wallet.id)
               const { address } = await kit.getAddress()
               setStellarAddress(address)
-              const res = await fetch(`https://horizon-testnet.stellar.org/accounts/${address}`)
-              if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`)
-              const data = await res.json()
-              setStellarBalances(data.balances || [])
+              
+              // Use exponential backoff for Horizon API calls
+              const data = await fetchWithBackoff(async () => {
+                const res = await fetch(`https://horizon-testnet.stellar.org/accounts/${address}`)
+                if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`)
+                return res.json()
+              }) as { balances?: StellarBalance[] }
+              
+              const balances = data.balances || []
+              setStellarBalances(balances)
+              stellarBalanceCache.set('stellar-balances', balances)
+              setLastRefreshTime(Date.now())
+              setRateLimitedUntil(null)
               resolve()
             } catch (err) {
               console.error('Error in onWalletSelected:', err)
@@ -802,7 +958,44 @@ export default function WalletBalances() {
       <div className="flex flex-wrap max-w-full gap-4">
         <Button className="w-auto bg-card text-foreground" onClick={fetchStarknetBalances}>Connect Starknet Wallet</Button>
         <Button className="w-auto bg-card text-foreground" onClick={fetchStellarBalances}>Connect Stellar Wallet</Button>
+        
+        {/* Refresh button with debounce and rate limiting */}
+        <Button 
+          className="w-auto bg-card text-foreground"
+          onClick={async () => {
+            const refreshCheck = canRefresh(lastRefreshTime)
+            if (!refreshCheck.allowed) {
+              console.warn(`Please wait ${refreshCheck.remainingSeconds} seconds before refreshing`)
+              return
+            }
+            
+            setIsRefreshing(true)
+            setLastRefreshTime(Date.now())
+            
+            // Refresh all connected wallets
+            if (starknetAddress) {
+              await fetchStarknetBalances()
+            }
+            if (stellarAddress) {
+              await fetchStellarBalances()
+            }
+            
+            setIsRefreshing(false)
+          }}
+          disabled={isRefreshing || (!starknetAddress && !stellarAddress)}
+        > 
+          {isRefreshing ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
+          {isRefreshing ? 'Refreshing...' : 'Refresh'}
+        </Button>
       </div>
+
+      {/* Rate limited message */}
+      {rateLimitedUntil && (
+        <div className="flex items-center gap-2 text-yellow-600 text-sm bg-yellow-50 px-3 py-2 rounded-lg">
+          <AlertCircle className="w-4 h-4" />
+          <span>Rate limited — try again in {Math.ceil((rateLimitedUntil - Date.now()) / 1000)} seconds</span>
+        </div>
+      )}
 
       {hasBalances ? (
         <>
@@ -840,6 +1033,13 @@ export default function WalletBalances() {
               </>
             )}
           </ScrollArea>
+          
+          {/* Last updated indicator */}
+          {lastRefreshTime && (
+            <div className="text-sm text-muted-foreground mt-2">
+              Last updated: {Math.floor((Date.now() - lastRefreshTime) / 1000)} seconds ago
+            </div>
+          )}
         </>
       ) : (
         <p className="text-center text-gray-400">Connect wallet to see your balances</p>
